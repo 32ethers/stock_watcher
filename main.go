@@ -21,9 +21,11 @@ import (
 )
 
 type Config struct {
-	Port     int           `yaml:"port"`
-	StocksCN []StockConfig `yaml:"stocks_cn"`
-	Crypto   []CryptoConf  `yaml:"crypto"`
+	Port           int           `yaml:"port"`
+	StocksCN       []StockConfig `yaml:"stocks_cn"`
+	Crypto         []CryptoConf  `yaml:"crypto"`
+	Earn           []EarnConf    `yaml:"earn"`
+	EtherscanKey   string        `yaml:"etherscan_api_key"`
 }
 
 type StockConfig struct {
@@ -33,6 +35,10 @@ type StockConfig struct {
 type CryptoConf struct {
 	Name   string `yaml:"name"`
 	Symbol string `yaml:"symbol"`
+}
+
+type EarnConf struct {
+	Asset string `yaml:"asset"`
 }
 
 const indexHTML = `<!DOCTYPE html>
@@ -147,9 +153,27 @@ const indexHTML = `<!DOCTYPE html>
                 <div class="loading">加载中<span class="loading-dots"></span></div>
             </div>
         </div>
+        <div class="card">
+            <div class="card-header">
+                <span class="left"><span class="icon">&#x1F4B3;</span> Binance 理财</span>
+                <span class="time" id="earn-time"></span>
+            </div>
+            <div class="card-body" id="earn-body">
+                <div class="loading">加载中<span class="loading-dots"></span></div>
+            </div>
+        </div>
+        <div class="card">
+            <div class="card-header">
+                <span class="left"><span class="icon">&#x26FD;</span> Ethereum Gas</span>
+                <span class="time" id="gas-time"></span>
+            </div>
+            <div class="card-body" id="gas-body">
+                <div class="loading">加载中<span class="loading-dots"></span></div>
+            </div>
+        </div>
     </div>
     <div class="footer">
-        按 F5 刷新数据 &middot; 数据来源：腾讯财经 / Yahoo Finance / Binance
+        按 F5 刷新数据 &middot; 数据来源：腾讯财经 / Yahoo Finance / Binance / Etherscan
     </div>
 <script>
 function badgeClass(pct) { return pct > 0 ? 'up' : pct < 0 ? 'down' : 'flat'; }
@@ -221,6 +245,27 @@ function renderCrypto(data) {
     ]);
 }
 
+function renderEarn(data) {
+    if (!data || data.length === 0) { document.getElementById('earn-body').innerHTML = '<div class="empty-state">暂无数据</div>'; return; }
+    var h = '<table><thead><tr><th>产品</th><th>活期年化 (APR)</th></tr></thead><tbody>';
+    for (var i = 0; i < data.length; i++) {
+        h += '<tr><td><span class="price">' + data[i].name + '</span></td>';
+        h += '<td><span class="badge badge-down">' + data[i].apr.toFixed(3) + '%</span></td></tr>';
+    }
+    h += '</tbody></table>';
+    document.getElementById('earn-body').innerHTML = h;
+}
+
+function renderGas(data) {
+    if (!data || !data.propose_gas) { document.getElementById('gas-body').innerHTML = '<div class="empty-state">暂无数据</div>'; return; }
+    var h = '<table><thead><tr><th>类型</th><th>Gas Price</th></tr></thead><tbody>';
+    h += '<tr><td><span class="main-name">Safe</span></td><td><span class="price">' + data.safe_gas + ' GWei</span></td></tr>';
+    h += '<tr><td><span class="main-name">Propose</span></td><td><span class="price">' + data.propose_gas + ' GWei</span></td></tr>';
+    h += '<tr><td><span class="main-name">Fast</span></td><td><span class="price">' + data.fast_gas + ' GWei</span></td></tr>';
+    h += '</tbody></table>';
+    document.getElementById('gas-body').innerHTML = h;
+}
+
 function showError(id, msg) { document.getElementById(id).innerHTML = '<div class="error-msg">' + msg + '</div>'; }
 function nowStr() { return new Date().toLocaleString('zh-CN', {hour12: false}); }
 
@@ -235,6 +280,8 @@ fetchBlock('indices', renderIndices, 'indices-body', 'indices-time');
 fetchBlock('stocks', renderStocks, 'stocks-body', 'stocks-time');
 fetchBlock('commodities', renderCommodities, 'commodities-body', 'commodities-time');
 fetchBlock('crypto', renderCrypto, 'crypto-body', 'crypto-time');
+fetchBlock('earn', renderEarn, 'earn-body', 'earn-time');
+fetchBlock('gas', renderGas, 'gas-body', 'gas-time');
 
 document.getElementById('globalTime').textContent = '更新时间：' + nowStr();
 Promise.all([
@@ -275,6 +322,17 @@ type CryptoInfo struct {
 	Name         string  `json:"name"`
 	PriceUSD     float64 `json:"price_usd"`
 	ChangePct24h float64 `json:"change_pct_24h"`
+}
+
+type EarnInfo struct {
+	Name string  `json:"name"`
+	APR  float64 `json:"apr"`
+}
+
+type GasInfo struct {
+	SafeGas    string `json:"safe_gas"`
+	ProposeGas string `json:"propose_gas"`
+	FastGas    string `json:"fast_gas"`
 }
 
 type APIResponse struct {
@@ -605,6 +663,100 @@ func handleCrypto(cfg *Config) APIResponse {
 	return APIResponse{Data: results}
 }
 
+func handleEarn(cfg *Config) APIResponse {
+	if len(cfg.Earn) == 0 {
+		return APIResponse{Data: []EarnInfo{}}
+	}
+
+	type earnResult struct {
+		index int
+		name  string
+		apr   float64
+		err   error
+	}
+
+	ch := make(chan earnResult, len(cfg.Earn))
+	for i, e := range cfg.Earn {
+		go func(idx int, asset string) {
+			url := fmt.Sprintf(
+				"https://www.binance.com/bapi/earn/v2/friendly/finance-earn/calculator/product/list?asset=%s&type=Flexible",
+				asset,
+			)
+			text, err := fetchURL(url)
+			if err != nil {
+				ch <- earnResult{index: idx, err: err}
+				return
+			}
+
+			var resp struct {
+				Data struct {
+					SavingFlexibleProduct []struct {
+						ProductName string `json:"productName"`
+						MarketApr   string `json:"marketApr"`
+					} `json:"savingFlexibleProduct"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(text), &resp); err != nil {
+				ch <- earnResult{index: idx, err: err}
+				return
+			}
+			if len(resp.Data.SavingFlexibleProduct) == 0 {
+				ch <- earnResult{index: idx, err: fmt.Errorf("no flexible product for %s", asset)}
+				return
+			}
+			p := resp.Data.SavingFlexibleProduct[0]
+			ch <- earnResult{index: idx, name: p.ProductName, apr: safeFloat(p.MarketApr) * 100}
+		}(i, e.Asset)
+	}
+
+	results := make([]EarnInfo, len(cfg.Earn))
+	var errs []string
+	for range cfg.Earn {
+		r := <-ch
+		if r.err != nil {
+			errs = append(errs, r.err.Error())
+			continue
+		}
+		results[r.index] = EarnInfo{Name: r.name, APR: math.Round(r.apr*1000) / 1000}
+	}
+	errStr := ""
+	if len(errs) > 0 {
+		errStr = strings.Join(errs, "; ")
+	}
+	return APIResponse{Data: results, Error: errStr}
+}
+
+func handleGas(cfg *Config) APIResponse {
+	if cfg.EtherscanKey == "" {
+		return APIResponse{Error: "未配置 etherscan_api_key"}
+	}
+	url := fmt.Sprintf(
+		"https://api.etherscan.io/v2/api?chainid=1&module=gastracker&action=gasoracle&apikey=%s",
+		cfg.EtherscanKey,
+	)
+	text, err := fetchURL(url)
+	if err != nil {
+		return APIResponse{Error: fmt.Sprintf("Gas 获取失败: %v", err)}
+	}
+
+	var resp struct {
+		Result struct {
+			SafeGasPrice    string `json:"SafeGasPrice"`
+			ProposeGasPrice string `json:"ProposeGasPrice"`
+			FastGasPrice    string `json:"FastGasPrice"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(text), &resp); err != nil {
+		return APIResponse{Error: fmt.Sprintf("Gas 解析失败: %v", err)}
+	}
+
+	return APIResponse{Data: GasInfo{
+		SafeGas:    resp.Result.SafeGasPrice,
+		ProposeGas: resp.Result.ProposeGasPrice,
+		FastGas:    resp.Result.FastGasPrice,
+	}}
+}
+
 func loadConfig() *Config {
 	cfg := &Config{Port: 8000}
 	data, err := os.ReadFile("config.yaml")
@@ -658,6 +810,8 @@ func main() {
 	mux.HandleFunc("/api/stocks", apiHandlerCfg(handleStocks))
 	mux.HandleFunc("/api/commodities", apiHandler(handleCommodities))
 	mux.HandleFunc("/api/crypto", apiHandlerCfg(handleCrypto))
+	mux.HandleFunc("/api/earn", apiHandlerCfg(handleEarn))
+	mux.HandleFunc("/api/gas", apiHandlerCfg(handleGas))
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf(":%d", cfg.Port),
